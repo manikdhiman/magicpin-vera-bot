@@ -1,10 +1,10 @@
-"""Gemini-powered deterministic message composer with retry and fallback resilience."""
+"""Gemini-powered deterministic message composer with retry, fallback, and anti-repetition guards."""
 
 from __future__ import annotations
 import os
 import json
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from google import genai
 from google.genai import types
 
@@ -21,6 +21,7 @@ class GeminiComposer:
         key = api_key or os.environ.get("GEMINI_API_KEY", "")
         self.client = genai.Client(api_key=key) if key else None
         self.model = "gemini-3.8-flash"
+        self._sent_cache: Dict[str, List[str]] = {}
 
     def compose_tick(
         self,
@@ -31,6 +32,7 @@ class GeminiComposer:
     ) -> Dict[str, Any]:
         prompt = build_tick_prompt(category, merchant, trigger, customer)
         owner = merchant.get("identity", {}).get("owner_first_name", "there")
+        m_id = merchant.get("merchant_id", "unknown")
 
         if not self.client:
             return {
@@ -41,7 +43,11 @@ class GeminiComposer:
                 "rationale": "Fallback composition without LLM key.",
             }
 
-        for attempt in range(3):
+        recent_bodies = self._sent_cache.get(m_id, [])
+        if recent_bodies:
+            prompt += f"\n\nCRITICAL ANTI-REPETITION CONSTRAINT: Do not repeat this recent wording sent to this merchant: '{recent_bodies[-1]}'"
+
+        for attempt in range(2):
             try:
                 response = self.client.models.generate_content(
                     model=self.model,
@@ -52,11 +58,15 @@ class GeminiComposer:
                         response_mime_type="application/json",
                     ),
                 )
-                return json.loads(response.text)
+                data = json.loads(response.text)
+                body = data.get("body", "")
+                if body:
+                    if m_id not in self._sent_cache:
+                        self._sent_cache[m_id] = []
+                    self._sent_cache[m_id].append(body)
+                return data
             except Exception:
-                if attempt < 2:
-                    time.sleep(1.5)
-                    continue
+                time.sleep(1)
 
         return {
             "body": f"Hi {owner}, checking in regarding updates for your listing.",
@@ -94,7 +104,6 @@ class GeminiComposer:
                 except Exception:
                     time.sleep(1)
 
-        # Reliable action mode fallback matching judge criteria
         if mode == "COMMIT_ACTION":
             return {
                 "action": "send",
@@ -116,5 +125,3 @@ class GeminiComposer:
             "cta": "open_ended",
             "rationale": "Resilient reply fallback.",
         }
-
-        

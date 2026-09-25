@@ -3,6 +3,8 @@
 from __future__ import annotations
 import os
 import time
+import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +16,9 @@ from core.store import ContextStore
 from core.decision import decide_triggers
 from core.state_machine import evaluate_reply_state
 from core.composer import GeminiComposer
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("vera-bot")
 
 app = FastAPI(title="magicpin Vera Bot")
 START_TIME = time.time()
@@ -102,12 +107,14 @@ async def receive_context(req: ContextRequest):
                 },
             )
 
+        # Fix #1: no-op re-post returns 200 accepted: true
         return {
             "accepted": True,
             "ack_id": f"ack_{req.context_id}_v{req.version}",
             "stored_at": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
+        logger.exception("Context ingestion failed")
         return JSONResponse(
             status_code=400,
             content={"accepted": False, "reason": "invalid_payload", "details": str(e)},
@@ -122,13 +129,11 @@ async def tick(req: TickRequest):
         current_time_iso=req.now,
     )
 
-    actions = []
-    for urgency, trg, merchant, category, customer in selected_candidates:
-        composed = composer.compose_tick(
-            category=category,
-            merchant=merchant,
-            trigger=trg,
-            customer=customer,
+    async def compose_one(candidate):
+        urgency, trg, merchant, category, customer = candidate
+        loop = asyncio.get_running_loop()
+        composed = await loop.run_in_executor(
+            None, composer.compose_tick, category, merchant, trg, customer
         )
 
         suppression_key = trg.get(
@@ -139,7 +144,7 @@ async def tick(req: TickRequest):
         customer_id = customer.get("customer_id") if customer else None
         send_as = "merchant_on_behalf" if customer else "vera"
 
-        action = {
+        return {
             "conversation_id": f"conv_{merchant.get('merchant_id')}_{trg.get('id')}",
             "merchant_id": merchant.get("merchant_id"),
             "customer_id": customer_id,
@@ -152,9 +157,18 @@ async def tick(req: TickRequest):
             "suppression_key": suppression_key,
             "rationale": composed.get("rationale", "Composed with strict context grounding."),
         }
-        actions.append(action)
 
-    return {"actions": actions}
+    try:
+        # Fix #5: Run concurrently within a 25-second execution ceiling
+        tasks = [compose_one(c) for c in selected_candidates]
+        actions = await asyncio.wait_for(asyncio.gather(*tasks), timeout=25.0)
+        return {"actions": list(actions)}
+    except asyncio.TimeoutError:
+        logger.warning("Tick composition timed out at 25s limit; returning partial/empty actions.")
+        return {"actions": []}
+    except Exception as e:
+        logger.exception("Tick composition failed")
+        return {"actions": []}
 
 
 @app.post("/v1/reply")
@@ -194,9 +208,10 @@ async def reply(req: ReplyRequest):
 
         return composed_reply
     except Exception as e:
+        logger.exception("Reply generation failed on unexpected error")
+        # Fix #6: Graceful wait rather than generating a fabricated action
         return {
-            "action": "send",
-            "body": "Done! Moving this to the next step immediately. Reply CONFIRM to proceed.",
-            "cta": "binary_confirm_cancel",
-            "rationale": f"Fallback recovery to avoid 500: {str(e)[:100]}",
+            "action": "wait",
+            "wait_seconds": 3600,
+            "rationale": f"Internal error, backing off rather than guessing: {str(e)[:100]}",
         }
