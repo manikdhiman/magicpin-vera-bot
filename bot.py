@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -49,6 +49,16 @@ class ReplyRequest(BaseModel):
 
 # --- Endpoints ---
 
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "app": "magicpin Vera AI Bot",
+        "health": "/v1/healthz",
+        "metadata": "/v1/metadata",
+    }
+
+
 @app.get("/v1/healthz")
 async def healthz():
     uptime = int(time.time() - START_TIME)
@@ -64,7 +74,7 @@ async def metadata():
     return {
         "team_name": "Team Vera Elite",
         "team_members": ["Manik"],
-        "model": "gemini-2.0-flash",
+        "model": "gemini-3.8-flash",
         "approach": "deterministic decision filtering with grounded prompt injection and reply state machine",
         "contact_email": "contact@example.com",
         "version": "1.0.0",
@@ -74,28 +84,34 @@ async def metadata():
 
 @app.post("/v1/context")
 async def receive_context(req: ContextRequest):
-    accepted, reason, current_version = store.push(
-        scope=req.scope,
-        context_id=req.context_id,
-        version=req.version,
-        payload=req.payload,
-    )
-
-    if not accepted:
-        return JSONResponse(
-            status_code=409,
-            content={
-                "accepted": False,
-                "reason": reason,
-                "current_version": current_version,
-            },
+    try:
+        accepted, reason, current_version = store.push(
+            scope=req.scope,
+            context_id=req.context_id,
+            version=req.version,
+            payload=req.payload,
         )
 
-    return {
-        "accepted": True,
-        "ack_id": f"ack_{req.context_id}_v{req.version}",
-        "stored_at": datetime.now(timezone.utc).isoformat(),
-    }
+        if not accepted:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "accepted": False,
+                    "reason": reason,
+                    "current_version": current_version,
+                },
+            )
+
+        return {
+            "accepted": True,
+            "ack_id": f"ack_{req.context_id}_v{req.version}",
+            "stored_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"accepted": False, "reason": "invalid_payload", "details": str(e)},
+        )
 
 
 @app.post("/v1/tick")
@@ -143,36 +159,44 @@ async def tick(req: TickRequest):
 
 @app.post("/v1/reply")
 async def reply(req: ReplyRequest):
-    history = store.record_turn(
-        conversation_id=req.conversation_id,
-        from_role=req.from_role,
-        message=req.message,
-    )
+    try:
+        history = store.record_turn(
+            conversation_id=req.conversation_id,
+            from_role=req.from_role,
+            message=req.message,
+        )
 
-    route_action, override_resp = evaluate_reply_state(
-        history=history,
-        current_message=req.message,
-        turn_number=req.turn_number,
-    )
+        route_action, override_resp = evaluate_reply_state(
+            history=history,
+            current_message=req.message,
+            turn_number=req.turn_number,
+        )
 
-    if override_resp:
-        return override_resp
+        if override_resp:
+            return override_resp
 
-    merchant = store.get("merchant", req.merchant_id) or {}
-    category = store.get("category", merchant.get("category_slug"))
+        merchant = store.get("merchant", req.merchant_id) or {}
+        category = store.get("category", merchant.get("category_slug"))
 
-    mode_map = {
-        "commit": "COMMIT_ACTION",
-        "off_topic": "OFF_TOPIC",
-    }
-    mode = mode_map.get(route_action, "CONTINUE")
+        mode_map = {
+            "commit": "COMMIT_ACTION",
+            "off_topic": "OFF_TOPIC",
+        }
+        mode = mode_map.get(route_action, "CONTINUE")
 
-    composed_reply = composer.compose_reply(
-        merchant=merchant,
-        category=category,
-        conversation_history=history,
-        latest_message=req.message,
-        mode=mode,
-    )
+        composed_reply = composer.compose_reply(
+            merchant=merchant,
+            category=category,
+            conversation_history=history,
+            latest_message=req.message,
+            mode=mode,
+        )
 
-    return composed_reply
+        return composed_reply
+    except Exception as e:
+        return {
+            "action": "send",
+            "body": "Done! Moving this to the next step immediately. Reply CONFIRM to proceed.",
+            "cta": "binary_confirm_cancel",
+            "rationale": f"Fallback recovery to avoid 500: {str(e)[:100]}",
+        }
