@@ -158,18 +158,24 @@ async def tick(req: TickRequest):
             "rationale": composed.get("rationale", "Composed with strict context grounding."),
         }
 
-    try:
-        # Fix #5: Run concurrently within a 25-second execution ceiling
-        tasks = [compose_one(c) for c in selected_candidates]
-        actions = await asyncio.wait_for(asyncio.gather(*tasks), timeout=25.0)
-        return {"actions": list(actions)}
-    except asyncio.TimeoutError:
-        logger.warning("Tick composition timed out at 25s limit; returning partial/empty actions.")
-        return {"actions": []}
-    except Exception as e:
-        logger.exception("Tick composition failed")
+    if not selected_candidates:
         return {"actions": []}
 
+    tasks = [asyncio.create_task(compose_one(c)) for c in selected_candidates]
+    try:
+        # Fix #4: Harvest completed results on timeout instead of discarding work
+        done, pending = await asyncio.wait(tasks, timeout=25.0)
+        for p in pending:
+            p.cancel()
+        actions = [
+            t.result() for t in done
+            if not t.cancelled() and t.exception() is None
+        ]
+        return {"actions": actions}
+    except Exception as e:
+        logger.exception("Tick processing encountered an unhandled exception")
+        return {"actions": []}   
+       
 
 @app.post("/v1/reply")
 async def reply(req: ReplyRequest):

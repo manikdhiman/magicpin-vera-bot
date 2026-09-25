@@ -1,4 +1,4 @@
-"""Gemini-powered deterministic message composer with retry, fallback, and anti-repetition guards."""
+"""Gemini-powered deterministic message composer with retry, fallback, and verified anti-repetition guards."""
 
 from __future__ import annotations
 import os
@@ -14,6 +14,15 @@ from core.prompts import (
     build_tick_prompt,
     build_reply_prompt,
 )
+
+
+def _too_similar(a: str, b: str) -> bool:
+    """Cheap overlap check: shares >70% of words with a prior message."""
+    wa, wb = set(a.lower().split()), set(b.lower().split())
+    if not wa or not wb:
+        return False
+    overlap = len(wa & wb) / min(len(wa), len(wb))
+    return overlap > 0.7
 
 
 class GeminiComposer:
@@ -47,6 +56,7 @@ class GeminiComposer:
         if recent_bodies:
             prompt += f"\n\nCRITICAL ANTI-REPETITION CONSTRAINT: Do not repeat this recent wording sent to this merchant: '{recent_bodies[-1]}'"
 
+        data: Optional[Dict[str, Any]] = None
         for attempt in range(2):
             try:
                 response = self.client.models.generate_content(
@@ -59,22 +69,47 @@ class GeminiComposer:
                     ),
                 )
                 data = json.loads(response.text)
-                body = data.get("body", "")
-                if body:
-                    if m_id not in self._sent_cache:
-                        self._sent_cache[m_id] = []
-                    self._sent_cache[m_id].append(body)
-                return data
+                break
             except Exception:
                 time.sleep(1)
 
-        return {
-            "body": f"Hi {owner}, checking in regarding updates for your listing.",
-            "cta": "open_ended",
-            "template_name": "vera_outbound_v1",
-            "template_params": [owner],
-            "rationale": "Fallback triggered after API retry.",
-        }
+        if not data:
+            return {
+                "body": f"Hi {owner}, checking in regarding updates for your listing.",
+                "cta": "open_ended",
+                "template_name": "vera_outbound_v1",
+                "template_params": [owner],
+                "rationale": "Fallback triggered after API retry.",
+            }
+
+        # Fix #3: Verify overlap against last 3 messages and retry once with elevated temperature
+        body = data.get("body", "")
+        if body and any(_too_similar(body, prev) for prev in recent_bodies[-3:]):
+            retry_prompt = (
+                prompt
+                + f"\n\nYour previous draft was too similar to a recent message. Rewrite with completely different phrasing and perspective: '{body}'"
+            )
+            try:
+                retry_response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=retry_prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=COMPOSER_SYSTEM_PROMPT,
+                        temperature=0.3,
+                        response_mime_type="application/json",
+                    ),
+                )
+                data = json.loads(retry_response.text)
+                body = data.get("body", body)
+            except Exception:
+                pass
+
+        if body:
+            if m_id not in self._sent_cache:
+                self._sent_cache[m_id] = []
+            self._sent_cache[m_id].append(body)
+
+        return data
 
     def compose_reply(
         self,
@@ -84,7 +119,9 @@ class GeminiComposer:
         latest_message: str,
         mode: str = "CONTINUE",
     ) -> Dict[str, Any]:
-        prompt = build_reply_prompt(merchant, category, conversation_history, latest_message, mode)
+        prompt = build_reply_prompt(
+            merchant, category, conversation_history, latest_message, mode
+        )
 
         if self.client:
             for attempt in range(2):

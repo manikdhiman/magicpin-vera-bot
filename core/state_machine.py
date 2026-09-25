@@ -18,14 +18,19 @@ AUTO_REPLY_PATTERNS = [
     r"we have received your message",
 ]
 
+# Fix #1: Multi-word phrases to avoid false matches on "stop by" or "monthly report"
 HOSTILE_PATTERNS = [
-    r"\bstop\b",
+    r"stop messaging",
+    r"stop contacting",
+    r"stop texting",
     r"\bunsubscribe\b",
-    r"\bspam\b",
+    r"useless spam",
     r"do not message",
     r"dont message",
     r"leave me alone",
-    r"report",
+    r"not interested",
+    r"opt out",
+    r"\bharass",
 ]
 
 COMMIT_PATTERNS = [
@@ -38,13 +43,14 @@ COMMIT_PATTERNS = [
     r"what'?s next",
 ]
 
+# Fix #2: Removed stray \bca\b pattern, added explicit "chartered accountant"
 OFF_TOPIC_PATTERNS = [
     r"\btax(es)?\b",
     r"\bgst\b",
-    r"\bca\b",
     r"unrelated",
     r"accounting",
     r"filing",
+    r"chartered accountant",
 ]
 
 
@@ -60,7 +66,6 @@ def is_hostile(message: str) -> bool:
 
 def is_commitment(message: str) -> bool:
     msg = message.lower()
-    # Negation check: "not sure", "no thanks", "don't send", "never ok"
     if re.search(r"\b(not|no|don'?t|never)\b.{0,15}\b(sure|ok|okay|yes)\b", msg):
         return False
     return any(re.search(pat, msg) for pat in COMMIT_PATTERNS)
@@ -87,9 +92,9 @@ def evaluate_reply_state(
             "rationale": "Merchant opted out or expressed hostility.",
         }
 
-    # Dedup check on any non-Vera inbound turn (merchant or customer)
     inbound_msgs = [
-        t["msg"].strip().lower() for t in history
+        t["msg"].strip().lower()
+        for t in history
         if t.get("from") in ("merchant", "customer")
     ]
     if len(inbound_msgs) >= 2 and inbound_msgs[-1] == inbound_msgs[-2]:
