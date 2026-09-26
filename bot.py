@@ -1,4 +1,4 @@
-"""FastAPI bot server exposing /v1/healthz, /v1/metadata, /v1/context, /v1/tick, and /v1/reply."""
+"""FastAPI bot server exposing /v1/healthz, /v1/metadata, /v1/context, /v1/tick, /v1/reply, and /v1/teardown."""
 
 from __future__ import annotations
 import os
@@ -107,7 +107,6 @@ async def receive_context(req: ContextRequest):
                 },
             )
 
-        # Fix #1: no-op re-post returns 200 accepted: true
         return {
             "accepted": True,
             "ack_id": f"ack_{req.context_id}_v{req.version}",
@@ -163,7 +162,6 @@ async def tick(req: TickRequest):
 
     tasks = [asyncio.create_task(compose_one(c)) for c in selected_candidates]
     try:
-        # Fix #4: Harvest completed results on timeout instead of discarding work
         done, pending = await asyncio.wait(tasks, timeout=25.0)
         for p in pending:
             p.cancel()
@@ -174,8 +172,8 @@ async def tick(req: TickRequest):
         return {"actions": actions}
     except Exception as e:
         logger.exception("Tick processing encountered an unhandled exception")
-        return {"actions": []}   
-       
+        return {"actions": []}
+
 
 @app.post("/v1/reply")
 async def reply(req: ReplyRequest):
@@ -193,6 +191,12 @@ async def reply(req: ReplyRequest):
         )
 
         if override_resp:
+            if override_resp.get("body"):
+                store.record_turn(
+                    conversation_id=req.conversation_id,
+                    from_role="vera",
+                    message=override_resp["body"],
+                )
             return override_resp
 
         merchant = store.get("merchant", req.merchant_id) or {}
@@ -212,12 +216,32 @@ async def reply(req: ReplyRequest):
             mode=mode,
         )
 
+        # Fix #3: Log Vera's own response into history so anti-repetition can inspect it
+        if composed_reply.get("body"):
+            store.record_turn(
+                conversation_id=req.conversation_id,
+                from_role="vera",
+                message=composed_reply["body"],
+            )
+
         return composed_reply
     except Exception as e:
         logger.exception("Reply generation failed on unexpected error")
-        # Fix #6: Graceful wait rather than generating a fabricated action
         return {
             "action": "wait",
             "wait_seconds": 3600,
             "rationale": f"Internal error, backing off rather than guessing: {str(e)[:100]}",
         }
+
+
+# Fix #1: Spec-compliant POST /v1/teardown wiping in-memory state
+@app.post("/v1/teardown")
+async def teardown():
+    store.categories.clear()
+    store.merchants.clear()
+    store.customers.clear()
+    store.triggers.clear()
+    store.conversations.clear()
+    store.sent_suppression_keys.clear()
+    logger.info("Teardown received — all in-memory state wiped.")
+    return {"status": "ok", "wiped": True}

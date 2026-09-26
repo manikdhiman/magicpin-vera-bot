@@ -1,4 +1,4 @@
-"""Gemini-powered deterministic message composer with retry, fallback, and verified anti-repetition guards."""
+"""Gemini-powered deterministic message composer with retry, fallback, anti-repetition, and empty-body guards."""
 
 from __future__ import annotations
 import os
@@ -25,6 +25,13 @@ def _too_similar(a: str, b: str) -> bool:
     return overlap > 0.7
 
 
+def _ensure_nonempty_body(data: Dict[str, Any], fallback_body: str) -> Dict[str, Any]:
+    """Guard against empty/whitespace body causing -2 penalties."""
+    if not data.get("body", "").strip():
+        data["body"] = fallback_body
+    return data
+
+
 class GeminiComposer:
     def __init__(self, api_key: Optional[str] = None):
         key = api_key or os.environ.get("GEMINI_API_KEY", "")
@@ -42,10 +49,11 @@ class GeminiComposer:
         prompt = build_tick_prompt(category, merchant, trigger, customer)
         owner = merchant.get("identity", {}).get("owner_first_name", "there")
         m_id = merchant.get("merchant_id", "unknown")
+        fallback_msg = f"Hi {owner}, checking in regarding updates for {merchant.get('identity', {}).get('name', 'your listing')}."
 
         if not self.client:
             return {
-                "body": f"Hi {owner}, checking in with updates for {merchant.get('identity', {}).get('name')}.",
+                "body": fallback_msg,
                 "cta": "open_ended",
                 "template_name": "vera_generic_v1",
                 "template_params": [owner],
@@ -75,14 +83,14 @@ class GeminiComposer:
 
         if not data:
             return {
-                "body": f"Hi {owner}, checking in regarding updates for your listing.",
+                "body": fallback_msg,
                 "cta": "open_ended",
                 "template_name": "vera_outbound_v1",
                 "template_params": [owner],
                 "rationale": "Fallback triggered after API retry.",
             }
 
-        # Fix #3: Verify overlap against last 3 messages and retry once with elevated temperature
+        # Check overlap against last 3 proactive dispatches for this merchant
         body = data.get("body", "")
         if body and any(_too_similar(body, prev) for prev in recent_bodies[-3:]):
             retry_prompt = (
@@ -100,9 +108,11 @@ class GeminiComposer:
                     ),
                 )
                 data = json.loads(retry_response.text)
-                body = data.get("body", body)
             except Exception:
                 pass
+
+        data = _ensure_nonempty_body(data, fallback_msg)
+        body = data.get("body", "")
 
         if body:
             if m_id not in self._sent_cache:
@@ -122,6 +132,8 @@ class GeminiComposer:
         prompt = build_reply_prompt(
             merchant, category, conversation_history, latest_message, mode
         )
+        prior_vera_bodies = [t["msg"] for t in conversation_history if t.get("from") == "vera"]
+        default_reply = "Got it — let me know how you would like to proceed."
 
         if self.client:
             for attempt in range(2):
@@ -137,10 +149,35 @@ class GeminiComposer:
                     )
                     data = json.loads(response.text)
                     if isinstance(data, dict) and "action" in data:
-                        return data
+                        body = data.get("body", "")
+                        # Fix #3: Check in-conversation duplicate against prior Vera turns
+                        if body and any(_too_similar(body, prev) for prev in prior_vera_bodies[-3:]):
+                            retry_prompt = prompt + (
+                                f"\n\nYour previous draft repeated earlier phrasing in this "
+                                f"conversation: '{body}'. Rewrite with a genuinely different "
+                                f"angle and wording."
+                            )
+                            try:
+                                retry_resp = self.client.models.generate_content(
+                                    model=self.model,
+                                    contents=retry_prompt,
+                                    config=types.GenerateContentConfig(
+                                        system_instruction=REPLY_SYSTEM_PROMPT,
+                                        temperature=0.3,
+                                        response_mime_type="application/json",
+                                    ),
+                                )
+                                retry_data = json.loads(retry_resp.text)
+                                if isinstance(retry_data, dict) and retry_data.get("body"):
+                                    return _ensure_nonempty_body(retry_data, default_reply)
+                            except Exception:
+                                pass
+
+                        return _ensure_nonempty_body(data, default_reply)
                 except Exception:
                     time.sleep(1)
 
+        # Fallback branches
         if mode == "COMMIT_ACTION":
             return {
                 "action": "send",

@@ -1,0 +1,12 @@
+name: keepalive
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Live Bot Endpoint
+        run: curl -sS https://magicpin-vera-bot-4mys.onrender.com/v1/healthz
