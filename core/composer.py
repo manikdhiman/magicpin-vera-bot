@@ -42,6 +42,10 @@ class GeminiComposer:
         self.model = "gemini-3.8-flash"
         self.fallback_model = "gemini-3.6-flash"  # established model, used if primary is unavailable
         self._sent_cache: Dict[str, List[str]] = {}
+        if self.client:
+            logger.info(f"GeminiComposer initialized WITH a key (ends in ...{key[-4:]}). Primary model={self.model}, fallback={self.fallback_model}.")
+        else:
+            logger.warning("GeminiComposer initialized WITHOUT a GEMINI_API_KEY — every composition will use generic fallback text. Set GEMINI_API_KEY in Render's environment.")
 
     def compose_tick(
         self,
