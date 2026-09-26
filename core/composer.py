@@ -1,4 +1,4 @@
-"""Gemini-powered deterministic message composer with retry, fallback, anti-repetition, and empty-body guards."""
+"""Gemini-powered deterministic message composer with retry, fallback, anti-repetition, and robust error logging."""
 
 from __future__ import annotations
 import os
@@ -9,14 +9,14 @@ from typing import Any, Dict, List, Optional
 from google import genai
 from google.genai import types
 
-logger = logging.getLogger("vera.composer")
-
 from core.prompts import (
     COMPOSER_SYSTEM_PROMPT,
     REPLY_SYSTEM_PROMPT,
     build_tick_prompt,
     build_reply_prompt,
 )
+
+logger = logging.getLogger("vera-composer")
 
 
 def _too_similar(a: str, b: str) -> bool:
@@ -29,7 +29,7 @@ def _too_similar(a: str, b: str) -> bool:
 
 
 def _ensure_nonempty_body(data: Dict[str, Any], fallback_body: str) -> Dict[str, Any]:
-    """Guard against empty/whitespace body causing -2 penalties."""
+    """Guard against empty/whitespace body causing penalties."""
     if not data.get("body", "").strip():
         data["body"] = fallback_body
     return data
@@ -39,13 +39,9 @@ class GeminiComposer:
     def __init__(self, api_key: Optional[str] = None):
         key = api_key or os.environ.get("GEMINI_API_KEY", "")
         self.client = genai.Client(api_key=key) if key else None
-        self.model = "gemini-3.8-flash"
-        self.fallback_model = "gemini-3.6-flash"  # established model, used if primary is unavailable
+        # Models supported on active Google AI endpoints
+        self.models_to_try = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
         self._sent_cache: Dict[str, List[str]] = {}
-        if self.client:
-            logger.info(f"GeminiComposer initialized WITH a key (ends in ...{key[-4:]}). Primary model={self.model}, fallback={self.fallback_model}.")
-        else:
-            logger.warning("GeminiComposer initialized WITHOUT a GEMINI_API_KEY — every composition will use generic fallback text. Set GEMINI_API_KEY in Render's environment.")
 
     def compose_tick(
         self,
@@ -73,11 +69,10 @@ class GeminiComposer:
             prompt += f"\n\nCRITICAL ANTI-REPETITION CONSTRAINT: Do not repeat this recent wording sent to this merchant: '{recent_bodies[-1]}'"
 
         data: Optional[Dict[str, Any]] = None
-        models_to_try = [self.model, self.model, self.fallback_model]
-        for attempt in range(3):
+        for attempt, model_name in enumerate(self.models_to_try):
             try:
                 response = self.client.models.generate_content(
-                    model=models_to_try[attempt],
+                    model=model_name,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         system_instruction=COMPOSER_SYSTEM_PROMPT,
@@ -86,11 +81,11 @@ class GeminiComposer:
                     ),
                 )
                 data = json.loads(response.text)
-                break
-            except Exception as e:
-                logger.error(f"compose_tick Gemini call failed (attempt {attempt+1}/3, model={models_to_try[attempt]}) for merchant={m_id}: {e!r}")
-                if attempt < 2:
-                    time.sleep(1.5 * (attempt + 1))
+                if isinstance(data, dict) and "body" in data:
+                    break
+            except Exception:
+                logger.exception(f"compose_tick Gemini call failed (attempt {attempt+1}/{len(self.models_to_try)}, model={model_name})")
+                time.sleep(1)
 
         if not data:
             return {
@@ -101,7 +96,6 @@ class GeminiComposer:
                 "rationale": "Fallback triggered after API retry.",
             }
 
-        # Check overlap against last 3 proactive dispatches for this merchant
         body = data.get("body", "")
         if body and any(_too_similar(body, prev) for prev in recent_bodies[-3:]):
             retry_prompt = (
@@ -110,7 +104,7 @@ class GeminiComposer:
             )
             try:
                 retry_response = self.client.models.generate_content(
-                    model=self.model,
+                    model=self.models_to_try[0],
                     contents=retry_prompt,
                     config=types.GenerateContentConfig(
                         system_instruction=COMPOSER_SYSTEM_PROMPT,
@@ -119,8 +113,8 @@ class GeminiComposer:
                     ),
                 )
                 data = json.loads(retry_response.text)
-            except Exception as e:
-                logger.error(f"compose_tick anti-repetition retry failed for merchant={m_id}: {e!r}")
+            except Exception:
+                logger.exception("compose_tick anti-repetition rewrite failed")
 
         data = _ensure_nonempty_body(data, fallback_msg)
         body = data.get("body", "")
@@ -147,11 +141,10 @@ class GeminiComposer:
         default_reply = "Got it — let me know how you would like to proceed."
 
         if self.client:
-            models_to_try = [self.model, self.model, self.fallback_model]
-            for attempt in range(3):
+            for attempt, model_name in enumerate(self.models_to_try):
                 try:
                     response = self.client.models.generate_content(
-                        model=models_to_try[attempt],
+                        model=model_name,
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             system_instruction=REPLY_SYSTEM_PROMPT,
@@ -162,7 +155,6 @@ class GeminiComposer:
                     data = json.loads(response.text)
                     if isinstance(data, dict) and "action" in data:
                         body = data.get("body", "")
-                        # Fix #3: Check in-conversation duplicate against prior Vera turns
                         if body and any(_too_similar(body, prev) for prev in prior_vera_bodies[-3:]):
                             retry_prompt = prompt + (
                                 f"\n\nYour previous draft repeated earlier phrasing in this "
@@ -171,7 +163,7 @@ class GeminiComposer:
                             )
                             try:
                                 retry_resp = self.client.models.generate_content(
-                                    model=self.model,
+                                    model=model_name,
                                     contents=retry_prompt,
                                     config=types.GenerateContentConfig(
                                         system_instruction=REPLY_SYSTEM_PROMPT,
@@ -182,16 +174,14 @@ class GeminiComposer:
                                 retry_data = json.loads(retry_resp.text)
                                 if isinstance(retry_data, dict) and retry_data.get("body"):
                                     return _ensure_nonempty_body(retry_data, default_reply)
-                            except Exception as e:
-                                logger.error(f"compose_reply anti-repetition retry failed for mode={mode}: {e!r}")
+                            except Exception:
+                                logger.exception("compose_reply anti-repetition rewrite failed")
 
                         return _ensure_nonempty_body(data, default_reply)
-                except Exception as e:
-                    logger.error(f"compose_reply Gemini call failed (attempt {attempt+1}/3, model={models_to_try[attempt]}) for mode={mode}: {e!r}")
-                    if attempt < 2:
-                        time.sleep(1.5 * (attempt + 1))
+                except Exception:
+                    logger.exception(f"compose_reply Gemini call failed (attempt {attempt+1}/{len(self.models_to_try)}, model={model_name}) for mode={mode}")
+                    time.sleep(1)
 
-        # Fallback branches
         if mode == "COMMIT_ACTION":
             return {
                 "action": "send",
