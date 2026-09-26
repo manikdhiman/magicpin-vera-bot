@@ -40,6 +40,7 @@ class GeminiComposer:
         key = api_key or os.environ.get("GEMINI_API_KEY", "")
         self.client = genai.Client(api_key=key) if key else None
         self.model = "gemini-3.8-flash"
+        self.fallback_model = "gemini-3.6-flash"  # established model, used if primary is unavailable
         self._sent_cache: Dict[str, List[str]] = {}
 
     def compose_tick(
@@ -68,10 +69,11 @@ class GeminiComposer:
             prompt += f"\n\nCRITICAL ANTI-REPETITION CONSTRAINT: Do not repeat this recent wording sent to this merchant: '{recent_bodies[-1]}'"
 
         data: Optional[Dict[str, Any]] = None
+        models_to_try = [self.model, self.model, self.fallback_model]
         for attempt in range(3):
             try:
                 response = self.client.models.generate_content(
-                    model=self.model,
+                    model=models_to_try[attempt],
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         system_instruction=COMPOSER_SYSTEM_PROMPT,
@@ -82,7 +84,7 @@ class GeminiComposer:
                 data = json.loads(response.text)
                 break
             except Exception as e:
-                logger.error(f"compose_tick Gemini call failed (attempt {attempt+1}/3) for merchant={m_id}: {e!r}")
+                logger.error(f"compose_tick Gemini call failed (attempt {attempt+1}/3, model={models_to_try[attempt]}) for merchant={m_id}: {e!r}")
                 if attempt < 2:
                     time.sleep(1.5 * (attempt + 1))
 
@@ -141,10 +143,11 @@ class GeminiComposer:
         default_reply = "Got it — let me know how you would like to proceed."
 
         if self.client:
+            models_to_try = [self.model, self.model, self.fallback_model]
             for attempt in range(3):
                 try:
                     response = self.client.models.generate_content(
-                        model=self.model,
+                        model=models_to_try[attempt],
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             system_instruction=REPLY_SYSTEM_PROMPT,
@@ -180,7 +183,7 @@ class GeminiComposer:
 
                         return _ensure_nonempty_body(data, default_reply)
                 except Exception as e:
-                    logger.error(f"compose_reply Gemini call failed (attempt {attempt+1}/3) for mode={mode}: {e!r}")
+                    logger.error(f"compose_reply Gemini call failed (attempt {attempt+1}/3, model={models_to_try[attempt]}) for mode={mode}: {e!r}")
                     if attempt < 2:
                         time.sleep(1.5 * (attempt + 1))
 
