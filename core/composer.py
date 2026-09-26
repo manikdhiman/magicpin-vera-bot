@@ -4,9 +4,12 @@ from __future__ import annotations
 import os
 import json
 import time
+import logging
 from typing import Any, Dict, List, Optional
 from google import genai
 from google.genai import types
+
+logger = logging.getLogger("vera.composer")
 
 from core.prompts import (
     COMPOSER_SYSTEM_PROMPT,
@@ -78,7 +81,8 @@ class GeminiComposer:
                 )
                 data = json.loads(response.text)
                 break
-            except Exception:
+            except Exception as e:
+                logger.error(f"compose_tick Gemini call failed (attempt {attempt+1}/2) for merchant={m_id}: {e!r}")
                 time.sleep(1)
 
         if not data:
@@ -108,8 +112,8 @@ class GeminiComposer:
                     ),
                 )
                 data = json.loads(retry_response.text)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"compose_tick anti-repetition retry failed for merchant={m_id}: {e!r}")
 
         data = _ensure_nonempty_body(data, fallback_msg)
         body = data.get("body", "")
@@ -170,11 +174,12 @@ class GeminiComposer:
                                 retry_data = json.loads(retry_resp.text)
                                 if isinstance(retry_data, dict) and retry_data.get("body"):
                                     return _ensure_nonempty_body(retry_data, default_reply)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.error(f"compose_reply anti-repetition retry failed for mode={mode}: {e!r}")
 
                         return _ensure_nonempty_body(data, default_reply)
-                except Exception:
+                except Exception as e:
+                    logger.error(f"compose_reply Gemini call failed (attempt {attempt+1}/2) for mode={mode}: {e!r}")
                     time.sleep(1)
 
         # Fallback branches

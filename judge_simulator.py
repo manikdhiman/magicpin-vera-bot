@@ -294,6 +294,9 @@ class JudgeSimulator:
             print_fail("Dataset load failed")
             return False
 
+        # Reset bot state before each local test run so repeated runs don't collide
+        self.client._request("POST", "/v1/teardown", 30)
+
         self.scorer = LLMScorer(self.llm, self.dataset)
         return self._all()
 
@@ -340,11 +343,15 @@ class JudgeSimulator:
         if err:
             print_fail(f"Reply error: {err}")
             return False
+        # --- DEBUG: always show exactly what the bot returned ---
+        print_info(f"merchant_id used for this test: {mid}")
+        print_info(f"Raw response from /v1/reply: {json.dumps(data, ensure_ascii=False)}")
+        # ---------------------------------------------------------
         body = data.get("body", "").lower()
         if any(w in body for w in ["done", "sending", "draft", "here", "confirm", "proceed"]):
             print_success("Bot correctly switched to ACTION mode")
             return True
-        print_fail("Bot failed action transition")
+        print_fail(f"Bot failed action transition. Full response: {data}")
         return False
 
     def _hostile(self) -> bool:
