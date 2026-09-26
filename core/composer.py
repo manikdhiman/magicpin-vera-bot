@@ -68,7 +68,7 @@ class GeminiComposer:
             prompt += f"\n\nCRITICAL ANTI-REPETITION CONSTRAINT: Do not repeat this recent wording sent to this merchant: '{recent_bodies[-1]}'"
 
         data: Optional[Dict[str, Any]] = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 response = self.client.models.generate_content(
                     model=self.model,
@@ -82,8 +82,9 @@ class GeminiComposer:
                 data = json.loads(response.text)
                 break
             except Exception as e:
-                logger.error(f"compose_tick Gemini call failed (attempt {attempt+1}/2) for merchant={m_id}: {e!r}")
-                time.sleep(1)
+                logger.error(f"compose_tick Gemini call failed (attempt {attempt+1}/3) for merchant={m_id}: {e!r}")
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
 
         if not data:
             return {
@@ -140,7 +141,7 @@ class GeminiComposer:
         default_reply = "Got it — let me know how you would like to proceed."
 
         if self.client:
-            for attempt in range(2):
+            for attempt in range(3):
                 try:
                     response = self.client.models.generate_content(
                         model=self.model,
@@ -179,8 +180,9 @@ class GeminiComposer:
 
                         return _ensure_nonempty_body(data, default_reply)
                 except Exception as e:
-                    logger.error(f"compose_reply Gemini call failed (attempt {attempt+1}/2) for mode={mode}: {e!r}")
-                    time.sleep(1)
+                    logger.error(f"compose_reply Gemini call failed (attempt {attempt+1}/3) for mode={mode}: {e!r}")
+                    if attempt < 2:
+                        time.sleep(1.5 * (attempt + 1))
 
         # Fallback branches
         if mode == "COMMIT_ACTION":
