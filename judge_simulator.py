@@ -3,7 +3,7 @@
 magicpin AI Challenge — LLM-Powered Judge Simulator
 ====================================================
 """
-
+import os
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -15,7 +15,7 @@ OLLAMA_URL = "http://localhost:11434"
 TEST_SCENARIO = "full_evaluation"
 # =============================================================================
 
-import os
+
 import sys
 import json
 import time
